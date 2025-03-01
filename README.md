@@ -4,7 +4,7 @@ Command line application that aims to provide a means of running and managing si
 This functions similarly to Secure Shell (SSH), but with the goal of allowing clients to manage long-running processes as well.
 
 # RSPI Server
-This repo is the server side of the RSPI Process Manager. See the client-side repo [here]([http://example.com](https://github.com/Yellowly/rs-pi-client)
+This repo is the server side of the RSPI Process Manager. See the client-side repo [here](https://github.com/Yellowly/rs-pi-client)
 
 # Usage
 Before running the executable for this, make sure you define the following environment variables:
