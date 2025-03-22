@@ -1,6 +1,8 @@
 pub(self) mod secure_stream;
 pub(self) mod command_runner;
 pub(self) mod file_transfer;
+pub(self) mod circular_buffer;
+pub(self) mod pterminal;
 mod client;
 
 use std::{env, net::TcpListener, sync::{Arc, Mutex}, thread};

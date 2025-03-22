@@ -1,4 +1,4 @@
-use std::{str, env, fs::File, io::{self, ErrorKind}, net::TcpStream, sync::{Arc, Mutex}, time::{self, Duration, UNIX_EPOCH}};
+use std::{env, fs::File, io::{self, ErrorKind, Read, Write}, net::TcpStream, str, sync::{Arc, Mutex}, time::{self, Duration, UNIX_EPOCH}};
 
 use super::command_runner::ClientSession;
 use super::secure_stream::SecureStream;
@@ -75,7 +75,7 @@ impl Client{
 
         let cwd = env::current_dir().unwrap();
 
-        Ok(Self{stream, session: ClientSession::new(cwd), processes})
+        Ok(Self{stream, session: ClientSession::new(cwd)?, processes})
     }
 
     /// Gets the hash used to encrypt messages by checking for the "RSPI_SERVER_HASHKEY" enviorment variable
@@ -109,7 +109,7 @@ impl Client{
     }
 
     /// Runs this client, constantly checking for messages until the client disconnects
-    pub fn run(&mut self){
+    pub fn run(mut self){
         let _ = self.stream.set_read_timeout(Some(Duration::new(0, 1000000)));
         println!("Connection established with {}, {}",self.stream.local_addr().unwrap().ip(),self.stream.peer_addr().unwrap().ip());
     
@@ -126,7 +126,7 @@ impl Client{
                     if msg_len==0 {break;}
                     let received_msg = str::from_utf8(&read_buffer[0..msg_len]).unwrap_or_default().trim_end_matches('\0');
                     // println!("Recieved response length {}: \n{}", msg_len, received_msg);
-                    if self.session.is_running(){
+                    if self.session.has_child(){
                         running_process=true;
                         if received_msg.starts_with("SIG"){
                             let _ = self.session.signal(received_msg);
@@ -160,30 +160,29 @@ impl Client{
                 },
             }
 
-            // send the output of the child process to the client, and exit status if it has finished.
-            if running_process{
-                if !self.session.is_running() { // this gets called once right after a child proccess exits
-                    running_process=false; 
-                }
+            // constantly read the output of the session and send it to the client
+            if let Ok(()) = self.session.read_output(&mut self.stream) {}
 
-                // due to the potential delay caused by the multi-threaded .lock() call inside of self.session, 
-                // we should check the client command session buffers AFTER checking if it has ended
-                let stdout = self.session.read_stdout();
-                let stderr = self.session.read_stderr();
-                if let Some(s) = stdout {let _ = self.stream.write(format!("{}\n",s).as_bytes());}
-                if let Some(s) = stderr {let _ = self.stream.write(format!("{}\n",s).as_bytes());}
+            // send exit status if it has finished.
+            else if running_process{
+                // if the process has just ended, print the CWD, and exit status if child process failed.
 
-                if !running_process{ // if the process has just ended, print the CWD, and exit status if child process failed.
-                    if let Some(status) = self.session.exit_status(){
-                        if !status.success(){let _ = self.stream.write(format!("Process exited with status {}\n",status).as_bytes());}
-                    }
+                // this is really scuffed and i should really create a 'on child end' callback, but that
+                // would require sending a closure to another thread which is headache i dont want to deal with
+                if let Some(status) = self.session.exit_status(){
+                    running_process = false;
+                    if !status.success(){let _ = self.stream.write(format!("Process exited with status {}\n",status).as_bytes());}
+                    let _ = self.stream.write(format!("{}$ ",self.session.path.display()).as_bytes());
+                }else if !self.session.has_child() {
+                    running_process = false;
                     let _ = self.stream.write(format!("{}$ ",self.session.path.display()).as_bytes());
                 }
             }
         }
         self.session.kill();
+        if self.session.close().is_err() { println!("Error closing session"); }
         println!("Client {} closed connection",self.stream.peer_addr().unwrap().ip());
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        if let Err(e) = self.stream.shutdown(std::net::Shutdown::Both) { println!("Failed to shutdown connection\n{}", e); }
     }
 
     /// In addition to running standard terminal commands as child processes, the client should be able to transfer "ownership" 
@@ -200,7 +199,7 @@ impl Client{
                         let _ = self.stream.write((procs.iter()
                                 .enumerate()
                                 .map(|(id, proc)| 
-                                    format!("{}\t{}\t{}",id, proc.cmd_name, if proc.is_running(){"running"}else{"not running"})
+                                    format!("{}\t{}\t{}",id, proc.cmd_name, if proc.has_child(){"running"}else{"not running"})
                                 )
                             .collect::<Vec<String>>()
                             .join("\n")
@@ -215,11 +214,22 @@ impl Client{
                     if let Some(arg) = temp.next(){
                         if let Ok(mut procs) = self.processes.lock(){
                             if let Ok(id) = arg.parse::<usize>(){
-                                self.session = procs.remove(id);
+                                self.session.set_is_outputting(false);
+                                let old_session = std::mem::replace(&mut self.session, procs.remove(id));
                                 let _ = self.stream.write(format!("Successfully took control of process {}: {}\n",id,self.session.cmd_name).as_bytes());
+                                if old_session.close().is_err(){
+                                    let _ = self.stream.write(format!("Error closing old process\n").as_bytes());
+                                }
+                                self.session.set_is_outputting(true);
                                 true
                             }else if let Some(id) = procs.iter().position(|proc| proc.cmd_name.eq_ignore_ascii_case(arg)){
-                                self.session = procs.remove(id);
+                                self.session.set_is_outputting(false);
+                                let old_session = std::mem::replace(&mut self.session, procs.remove(id));
+                                let _ = self.stream.write(format!("Successfully took control of process {}: {}\n",id,self.session.cmd_name).as_bytes());
+                                if old_session.close().is_err(){
+                                    let _ = self.stream.write(format!("Error closing old process\n").as_bytes());
+                                }
+                                self.session.set_is_outputting(true);
                                 let _ = self.stream.write(format!("Successfully took control of process {}: {}\n",id,self.session.cmd_name).as_bytes());
                                 true
                             }else{
@@ -240,8 +250,16 @@ impl Client{
                     let path = self.session.path.clone();
                     let name = self.session.cmd_name.clone();
                     if let Ok(mut procs) = self.processes.lock(){
-                        procs.push(std::mem::replace(&mut self.session, ClientSession::new(path)));
-                        let _ = self.stream.write(format!("Sucessfully gave control of {} to proccess manager with id {}\n",name,procs.len()-1).as_bytes());
+                        match ClientSession::new(path){
+                            Ok(new_session) => {
+                                self.session.set_is_outputting(false);
+                                procs.push(std::mem::replace(&mut self.session, new_session));
+                                let _ = self.stream.write(format!("Sucessfully gave control of {} to proccess manager with id {}\n",name,procs.len()-1).as_bytes());        
+                            },
+                            Err(e) => {
+                                let _ = self.stream.write(format!("Unable to create new session:\n{}",e).as_bytes());        
+                            }
+                        }
                     }
                     false
                 },
